@@ -1,0 +1,11 @@
+
+# ignore bot data files, they will be generated anyway
+*.json
+
+# ignore .env files
+*.env
+
+#ignore  backup files
+*.backup
+*_FINAL.csv
+*.python-version

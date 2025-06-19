@@ -113,7 +113,7 @@ beeg-summoning-bot/
 ### Key Settings (in `main.py`)
 
 ```python
-BEEG_USER_ID = 359912802787393547      # Target user's Discord ID
+BEEG_USER_ID = os.getenv('USER_ID')      # Target user's Discord ID
 DESTINATION_CHANNEL_NAME = 'general'    # Channel to send messages
 SUMMON_INTERVAL_HOURS = 3               # Hours between messages
 ```

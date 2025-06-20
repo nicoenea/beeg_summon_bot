@@ -16,6 +16,10 @@ BEEG_USER_ID = int(os.getenv('BEEG_USER_ID'))  # Replace with Beeg's actual user
 DESTINATION_CHANNEL_NAME = 'general'  # Channel name to send messages to
 SUMMON_INTERVAL_HOURS = 3 # How often to summon when offline
 
+# Do not disturb hours configuration (24-hour format)
+DO_NOT_DISTURB_START_HOUR = 0   # Midnight (0)
+DO_NOT_DISTURB_END_HOUR = 7     # 7 AM
+
 # File paths for data persistence
 MESSAGES_FILE = 'summoning_messages.json'
 USED_MESSAGES_FILE = 'used_messages.json'
@@ -38,6 +42,44 @@ class BeegSummoningBot:
         self.beeg_current_status = None
         self.summoning_task = None
         self.load_data()
+    
+    def is_do_not_disturb_time(self):
+        """Check if current time is within do-not-disturb hours"""
+        current_hour = datetime.now().hour
+        
+        if DO_NOT_DISTURB_START_HOUR <= DO_NOT_DISTURB_END_HOUR:
+            # Normal case: e.g., 22:00 to 06:00 (doesn't cross midnight)
+            return DO_NOT_DISTURB_START_HOUR <= current_hour < DO_NOT_DISTURB_END_HOUR
+        else:
+            # Crosses midnight: e.g., 22:00 to 06:00
+            return current_hour >= DO_NOT_DISTURB_START_HOUR or current_hour < DO_NOT_DISTURB_END_HOUR
+    
+    def get_next_allowed_summon_time(self):
+        """Get the next time when summoning is allowed"""
+        now = datetime.now()
+        current_hour = now.hour
+        
+        if not self.is_do_not_disturb_time():
+            return now  # Can send now
+        
+        # Calculate next allowed time
+        if DO_NOT_DISTURB_START_HOUR <= DO_NOT_DISTURB_END_HOUR:
+            # Simple case: disturbance period doesn't cross midnight
+            next_allowed = now.replace(hour=DO_NOT_DISTURB_END_HOUR, minute=0, second=0, microsecond=0)
+            if next_allowed <= now:
+                next_allowed += timedelta(days=1)
+        else:
+            # Crosses midnight
+            if current_hour >= DO_NOT_DISTURB_START_HOUR:
+                # Currently in the late night portion, wait until morning
+                next_allowed = now.replace(hour=DO_NOT_DISTURB_END_HOUR, minute=0, second=0, microsecond=0)
+                if next_allowed <= now:
+                    next_allowed += timedelta(days=1)
+            else:
+                # Currently in the early morning portion, wait until end time today
+                next_allowed = now.replace(hour=DO_NOT_DISTURB_END_HOUR, minute=0, second=0, microsecond=0)
+        
+        return next_allowed
     
     def load_summoning_messages_from_csv(self):
         """Load messages from CSV files (phrases and haikus)"""
@@ -210,6 +252,14 @@ class BeegSummoningBot:
             await asyncio.sleep(SUMMON_INTERVAL_HOURS * 3600)
             
             while self.beeg_current_status == 'offline':
+                # Check if it's do-not-disturb time
+                if self.is_do_not_disturb_time():
+                    next_allowed = self.get_next_allowed_summon_time()
+                    wait_seconds = (next_allowed - datetime.now()).total_seconds()
+                    print(f"Do-not-disturb time active. Waiting {wait_seconds/3600:.1f} hours until {next_allowed.strftime('%H:%M')} to summon.")
+                    await asyncio.sleep(wait_seconds)
+                    continue
+                
                 await self.send_summoning_message()
                 await asyncio.sleep(SUMMON_INTERVAL_HOURS * 3600)
                 
@@ -223,6 +273,11 @@ class BeegSummoningBot:
         if current_status != 'offline':
             print("Beeg is no longer offline, stopping summons")
             await self.stop_summoning_cycle()
+            return
+        
+        # Double-check do-not-disturb time
+        if self.is_do_not_disturb_time():
+            print("Attempted to send message during do-not-disturb hours, skipping")
             return
         
         # Find the general channel in any guild
@@ -255,9 +310,9 @@ class BeegSummoningBot:
         
         # Add some flair based on message type
         if message_data['type'] == 'haiku':
-            formatted_message = f"🎋 **Auto-Haiku #{message_data['id']}** 🎋{offline_duration}\n```\n{message_text}\n```"
+            formatted_message = f"🎋 **Auto-Haiku #{message_data['id']}** 🎋\n```\n{message_text}\n```"
         else:
-            formatted_message = f"📢 **Auto-Summon #{message_data['id']}** 📢{offline_duration}\n{message_text}"
+            formatted_message = f"📢 **Auto-Summon #{message_data['id']}** 📢\n{message_text}"
         
         try:
             await general_channel.send(formatted_message)
@@ -299,8 +354,10 @@ summoning_bot = BeegSummoningBot()
 
 @bot.event
 async def on_ready():
+    print(f'Current time: {datetime.now()}')
     print(f'{bot.user} has connected to Discord!')
     print(f'Bot is in {len(bot.guilds)} guilds')
+    print(f'Do-not-disturb hours: {DO_NOT_DISTURB_START_HOUR:02d}:00 to {DO_NOT_DISTURB_END_HOUR:02d}:00')
     
     # Check Beeg's initial status and start summoning if needed
     await summoning_bot.check_initial_beeg_status()
@@ -316,6 +373,33 @@ async def on_presence_update(before, after):
         if old_status != new_status:
             await summoning_bot.on_beeg_status_change(old_status, new_status)
 
+# Helper function for cleanup commands
+async def delete_bot_messages_except_latest(channel, limit=None):
+    """Delete all bot messages except the most recent one"""
+    bot_messages = []
+    
+    # Collect bot messages
+    async for message in channel.history(limit=limit):
+        if message.author == bot.user:
+            bot_messages.append(message)
+    
+    # Sort by timestamp (newest first) and skip the first one
+    bot_messages.sort(key=lambda m: m.created_at, reverse=True)
+    messages_to_delete = bot_messages[1:]  # Skip the newest message
+    
+    deleted_count = 0
+    for message in messages_to_delete:
+        try:
+            await message.delete()
+            deleted_count += 1
+            await asyncio.sleep(0.5)  # Rate limiting
+        except discord.errors.NotFound:
+            pass  # Message already deleted
+        except Exception as e:
+            print(f"Error deleting message: {e}")
+    
+    return deleted_count
+
 # Fix 1: Update the manual summon command (replace the existing command)
 @bot.command(name='summon')
 async def summon_command(ctx, user: discord.Member = None):
@@ -326,6 +410,14 @@ async def summon_command(ctx, user: discord.Member = None):
         if user is None:
             await ctx.send("❌ Could not find the target user!")
             return
+    
+    # Check if it's do-not-disturb time for automatic summons
+    if summoning_bot.is_do_not_disturb_time():
+        next_allowed = summoning_bot.get_next_allowed_summon_time()
+        await ctx.send(f"🌙 **Do-not-disturb time active!**\n"
+                      f"⏰ Quiet hours: {DO_NOT_DISTURB_START_HOUR:02d}:00 - {DO_NOT_DISTURB_END_HOUR:02d}:00\n"
+                      f"🔔 Next summon allowed at: {next_allowed.strftime('%H:%M')}\n"
+                      f"💡 *Manual summons still work during quiet hours*")
     
     # Get a random summoning message
     message_data = summoning_bot.get_random_message()
@@ -350,33 +442,29 @@ async def summon_command(ctx, user: discord.Member = None):
 
 @bot.command(name='cleanup')
 async def cleanup_bot_messages(ctx, limit: int = 10):
-    """Delete the bot's recent messages (default: last 10 messages)"""
+    """Delete the bot's recent messages except the latest one (default: last 10 messages)"""
     if limit > 50:
         await ctx.send("❌ Limit too high! Maximum 50 messages at once.")
         return
     
     try:
-        deleted_count = 0
-        
-        # Get recent messages from the channel
-        async for message in ctx.channel.history(limit=100):
-            if deleted_count >= limit:
-                break
-                
-            # Check if message was sent by this bot
-            if message.author == bot.user:
-                await message.delete()
-                deleted_count += 1
-                # Small delay to avoid rate limiting
-                await asyncio.sleep(0.5)
+        deleted_count = await delete_bot_messages_except_latest(ctx.channel, limit=100)
         
         if deleted_count > 0:
             # Send confirmation (this will auto-delete after 5 seconds)
-            confirmation = await ctx.send(f"🗑️ Deleted {deleted_count} bot messages!")
+            confirmation = await ctx.send(f"🗑️ Deleted {deleted_count} bot messages (kept the latest one)!")
             await asyncio.sleep(5)
             await confirmation.delete()
         else:
             await ctx.send("ℹ️ No bot messages found to delete.")
+        
+        # Delete the user's command message
+        try:
+            await ctx.message.delete()
+        except discord.errors.NotFound:
+            pass  # Message already deleted
+        except Exception as e:
+            print(f"Error deleting command message: {e}")
             
     except discord.errors.Forbidden:
         await ctx.send("❌ Bot doesn't have permission to delete messages in this channel.")
@@ -385,12 +473,10 @@ async def cleanup_bot_messages(ctx, limit: int = 10):
 
 @bot.command(name='cleanup_all')
 async def cleanup_all_bot_messages(ctx):
-    """Delete ALL bot messages in this channel (use with caution!)"""
+    """Delete ALL bot messages except the latest one in this channel (use with caution!)"""
     try:
-        deleted_count = 0
-        
         # Confirm before mass deletion
-        confirm_msg = await ctx.send("⚠️ This will delete ALL bot messages in this channel. React with ✅ to confirm (30 second timeout)")
+        confirm_msg = await ctx.send("⚠️ This will delete ALL bot messages except the latest one in this channel. React with ✅ to confirm (30 second timeout)")
         await confirm_msg.add_reaction("✅")
         
         def check(reaction, user):
@@ -404,18 +490,21 @@ async def cleanup_all_bot_messages(ctx):
         
         await confirm_msg.delete()
         
-        # Delete all bot messages
-        async for message in ctx.channel.history(limit=None):
-            if message.author == bot.user:
-                await message.delete()
-                deleted_count += 1
-                # Small delay to avoid rate limiting
-                await asyncio.sleep(0.5)
+        # Delete all bot messages except the latest one
+        deleted_count = await delete_bot_messages_except_latest(ctx.channel)
         
         # Send final confirmation
-        final_msg = await ctx.send(f"🗑️ Cleanup complete! Deleted {deleted_count} bot messages.")
+        final_msg = await ctx.send(f"🗑️ Cleanup complete! Deleted {deleted_count} bot messages (kept the latest one).")
         await asyncio.sleep(5)
         await final_msg.delete()
+        
+        # Delete the user's command message
+        try:
+            await ctx.message.delete()
+        except discord.errors.NotFound:
+            pass  # Message already deleted
+        except Exception as e:
+            print(f"Error deleting command message: {e}")
         
     except discord.errors.Forbidden:
         await ctx.send("❌ Bot doesn't have permission to delete messages in this channel.")
@@ -441,6 +530,12 @@ async def reload_messages(ctx):
         await ctx.send(f"✅ **Messages reloaded from CSV files!**\n"
                       f"📝 Total: {total_messages} ({phrases} phrases, {haikus} haikus)\n"
                       f"🔄 Used message list reset")
+        
+        # Delete the user's command message
+        try:
+            await ctx.message.delete()
+        except discord.errors.NotFound:
+            pass
         
     except Exception as e:
         await ctx.send(f"❌ **Error reloading messages:** {e}")
@@ -471,6 +566,12 @@ async def force_csv_reload(ctx):
                       f"📝 Total: {total_messages} ({phrases} phrases, {haikus} haikus)\n"
                       f"🗑️ Deleted old cache files\n"
                       f"🔄 Used message list reset")
+        
+        # Delete the user's command message
+        try:
+            await ctx.message.delete()
+        except discord.errors.NotFound:
+            pass
         
     except Exception as e:
         await ctx.send(f"❌ **Error during force reload:** {e}")
@@ -507,11 +608,15 @@ async def summon_stats(ctx):
     last_time = summoning_bot.last_message_time
     last_time_str = last_time.strftime("%Y-%m-%d %H:%M:%S") if last_time else "Never"
     
+    # Do-not-disturb status
+    dnd_status = "🌙 ACTIVE" if summoning_bot.is_do_not_disturb_time() else "☀️ INACTIVE"
+    
     stats_message = (f"📊 **Beeg Summoning Stats** 📊\n"
                     f"📝 Total messages: {total_messages} ({phrases} phrases, {haikus} haikus)\n"
                     f"✅ Used messages: {used_messages}\n"
                     f"⏳ Remaining: {remaining}\n"
-                    f"🕐 Last auto-summon: {last_time_str}")
+                    f"🕐 Last auto-summon: {last_time_str}\n"
+                    f"🔕 Do-not-disturb ({DO_NOT_DISTURB_START_HOUR:02d}:00-{DO_NOT_DISTURB_END_HOUR:02d}:00): {dnd_status}")
     
     await ctx.send(stats_message)
 
@@ -522,6 +627,12 @@ async def reset_summons(ctx):
     summoning_bot.used_messages.clear()
     summoning_bot.save_used_messages()
     await ctx.send("🔄 **Summoning messages reset!** All messages are now available again.")
+    
+    # Delete the user's command message
+    try:
+        await ctx.message.delete()
+    except discord.errors.NotFound:
+        pass
 
 @bot.command(name='beeg_status')
 async def beeg_status(ctx):
@@ -567,7 +678,13 @@ async def beeg_status(ctx):
         else:
             offline_info += "\n🔮 Auto-summoning: INACTIVE"
     
-    await ctx.send(f"{status_emoji} **Beeg is currently: {status_text}**{offline_info}")
+    # Add do-not-disturb status
+    dnd_info = ""
+    if summoning_bot.is_do_not_disturb_time():
+        next_allowed = summoning_bot.get_next_allowed_summon_time()
+        dnd_info = f"\n🌙 Do-not-disturb active until {next_allowed.strftime('%H:%M')}"
+    
+    await ctx.send(f"{status_emoji} **Beeg is currently: {status_text}**{offline_info}{dnd_info}")
 
 @bot.command(name='force_summon_check')
 @commands.has_permissions(administrator=True)
@@ -581,6 +698,12 @@ async def force_summon_check(ctx):
                    f"Previous: {old_status}\n"
                    f"Current: {new_status}\n"
                    f"Summoning active: {summoning_bot.summoning_task is not None and not summoning_bot.summoning_task.done()}")
+    
+    # Delete the user's command message
+    try:
+        await ctx.message.delete()
+    except discord.errors.NotFound:
+        pass
 
 @bot.command(name='stop_summoning')
 @commands.has_permissions(administrator=True)
@@ -588,6 +711,33 @@ async def stop_summoning(ctx):
     """Stop automatic summoning (admin only)"""
     await summoning_bot.stop_summoning_cycle()
     await ctx.send("🛑 **Automatic summoning stopped!** Beeg is safe... for now.")
+    
+    # Delete the user's command message
+    try:
+        await ctx.message.delete()
+    except discord.errors.NotFound:
+        pass
+
+@bot.command(name='dnd_status')
+async def dnd_status(ctx):
+    """Check current do-not-disturb status"""
+    current_time = datetime.now()
+    is_dnd = summoning_bot.is_do_not_disturb_time()
+    
+    if is_dnd:
+        next_allowed = summoning_bot.get_next_allowed_summon_time()
+        time_remaining = next_allowed - current_time
+        hours = int(time_remaining.total_seconds() // 3600)
+        minutes = int((time_remaining.total_seconds() % 3600) // 60)
+        
+        await ctx.send(f"🌙 **Do-not-disturb is ACTIVE**\n"
+                      f"⏰ Quiet hours: {DO_NOT_DISTURB_START_HOUR:02d}:00 - {DO_NOT_DISTURB_END_HOUR:02d}:00\n"
+                      f"🔔 Next summon allowed: {next_allowed.strftime('%H:%M')}\n"
+                      f"⏳ Time remaining: {hours}h {minutes}m")
+    else:
+        await ctx.send(f"☀️ **Do-not-disturb is INACTIVE**\n"
+                      f"⏰ Quiet hours: {DO_NOT_DISTURB_START_HOUR:02d}:00 - {DO_NOT_DISTURB_END_HOUR:02d}:00\n"
+                      f"✅ Auto-summoning is allowed right now!")
 
 if __name__ == "__main__":
     # Make sure to replace 'YOUR_BOT_TOKEN_HERE' with your actual bot token
